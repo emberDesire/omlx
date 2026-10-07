@@ -7035,6 +7035,9 @@ class Scheduler:
         # Bare grammars constrain the answer from its first token. Forcing a
         # thinking close into them can leave every logit masked to -inf. Only
         # grammars compiled with a separate reasoning phase can use a budget.
+        # Native chat templates may already contain the thinking opener, so
+        # needs_think_prefix can be false even when a budget was requested.
+        # Token resolution below still gates models without a close marker.
         grammar_allows_thinking = sampling_params.compiled_grammar is None or (
             getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
             is True
@@ -7043,10 +7046,6 @@ class Scheduler:
             grammar_allows_thinking
             and sampling_params.thinking_budget is not None
             and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
         ):
             request_think_end_id = getattr(request, "think_end_token_id", None)
             if request_think_end_id is not None:

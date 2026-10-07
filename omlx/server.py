@@ -2986,6 +2986,12 @@ async def _json_response_or_keepalive(
                 content=_prefill_memory_openai_error_body(e),
                 headers=headers,
             )
+        except _ToolCallGenerationError as e:
+            return JSONResponse(
+                status_code=500,
+                content=_openai_error_body(e.detail, 500, code=e.code),
+                headers=headers,
+            )
         return Response(content=result, media_type=media_type, headers=headers)
 
     generator = _with_json_keepalive(http_request, task)
@@ -5141,21 +5147,55 @@ def _compile_forced_tool_grammar(
             "tool_choice requires xgrammar for this model. Install the grammar extra.",
             field="tool_choice",
         )
-    names = [required_name] if required_name else sorted(_registered_tool_names(tools))
-    alternatives = "|".join(re.escape(name) for name in names)
-    # The first token must begin a call. Repetition allows multiple calls and
-    # whitespace between them, but cannot produce a prose-only completion.
-    pattern = (
-        rf"(<tool_call>\s*<function=({alternatives})>"
-        r"[\s\S]*</function>\s*</tool_call>\s*)+"
-    )
-    fmt = {"type": "regex", "pattern": pattern}
+    from .utils.tokenizer import unwrap_tokenizer
+
+    template = getattr(unwrap_tokenizer(engine.tokenizer), "chat_template", "")
+    if isinstance(template, str) and "return a json object" in template.lower():
+        choices = []
+        for tool in tools:
+            function = tool.get("function", {})
+            name = function.get("name")
+            if not name or (required_name and name != required_name):
+                continue
+            parameters = function.get("parameters") or {"type": "object"}
+            choices.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"const": name},
+                        "arguments": parameters,
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                }
+            )
+        schema = choices[0] if len(choices) == 1 else {"oneOf": choices}
+        fmt = {
+            "type": "sequence",
+            "elements": [
+                {"type": "const_string", "value": "<tool_call>\n"},
+                {"type": "json_schema", "json_schema": schema},
+                {"type": "const_string", "value": "\n</tool_call>"},
+            ],
+        }
+    else:
+        names = [required_name] if required_name else sorted(_registered_tool_names(tools))
+        alternatives = "|".join(re.escape(name) for name in names)
+        pattern = (
+            rf"(<tool_call>\s*<function=({alternatives})>"
+            r"[\s\S]*</function>\s*</tool_call>\s*)+"
+        )
+        fmt = {"type": "regex", "pattern": pattern}
     try:
         if reasoning_parser:
             return _compile_with_structural_tag(
                 compiler, fmt, reasoning_parser, chat_template_kwargs
             )
-        return compiler.compile_regex(pattern)
+        if fmt["type"] == "sequence":
+            return compiler.compile_structural_tag(
+                {"type": "structural_tag", "format": fmt}
+            )
+        return compiler.compile_regex(fmt["pattern"])
     except Exception as exc:
         raise InvalidRequestError(
             f"Could not compile tool_choice grammar: {exc}", field="tool_choice"

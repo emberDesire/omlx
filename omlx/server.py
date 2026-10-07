@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -3738,6 +3739,23 @@ async def create_chat_completion(
         # Gemma 4 drops required params that lack descriptions — enrich them
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+        forced_tool_name = _required_tool_name(request.tool_choice, tools_for_template)
+        if forced_tool_name is not None:
+            if structured_outputs is not None or _response_format_requests_grammar(
+                response_format
+            ):
+                raise InvalidRequestError(
+                    "tool_choice cannot be combined with structured output constraints.",
+                    field="tool_choice",
+                )
+            await engine.start()
+            compiled_grammar = _compile_forced_tool_grammar(
+                engine,
+                tools_for_template,
+                forced_tool_name,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=merged_ct_kwargs or None,
+            )
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -4018,6 +4036,14 @@ async def create_chat_completion(
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
+            forced_failure = _forced_tool_call_failure(
+                request.tool_choice, tools_for_template, tool_calls
+            )
+            if forced_failure:
+                raise HTTPException(
+                    status_code=500, detail=forced_failure["error"]["message"]
+                )
+
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
             return ChatCompletionResponse(
@@ -4292,6 +4318,50 @@ def _compile_bare_grammar(compiler, fmt: dict):
     elif fmt["type"] == "regex":
         return compiler.compile_regex(fmt["pattern"])
     return None
+
+
+def _compile_forced_tool_grammar(
+    engine: BaseEngine,
+    tools: list[dict],
+    required_name: str,
+    *,
+    reasoning_parser: str | None,
+    chat_template_kwargs: dict | None,
+):
+    """Force at least one Qwen XML call with a registered function name.
+
+    Other parser formats retain final-response validation below. The XML body
+    remains flexible because parameter encoding depends on each tool schema;
+    parsed calls are checked again before returning them to the client.
+    """
+    parser = getattr(getattr(engine, "tokenizer", None), "tool_parser", None)
+    if not getattr(parser, "__module__", "").endswith(".qwen3_coder"):
+        return None
+    compiler = getattr(engine, "grammar_compiler", None)
+    if compiler is None:
+        raise InvalidRequestError(
+            "tool_choice requires xgrammar for this model. Install the grammar extra.",
+            field="tool_choice",
+        )
+    names = [required_name] if required_name else sorted(_registered_tool_names(tools))
+    alternatives = "|".join(re.escape(name) for name in names)
+    # The first token must begin a call. Repetition allows multiple calls and
+    # whitespace between them, but cannot produce a prose-only completion.
+    pattern = (
+        rf"(<tool_call>\s*<function=({alternatives})>"
+        r"[\s\S]*</function>\s*</tool_call>\s*)+"
+    )
+    fmt = {"type": "regex", "pattern": pattern}
+    try:
+        if reasoning_parser:
+            return _compile_with_structural_tag(
+                compiler, fmt, reasoning_parser, chat_template_kwargs
+            )
+        return compiler.compile_regex(pattern)
+    except Exception as exc:
+        raise InvalidRequestError(
+            f"Could not compile tool_choice grammar: {exc}", field="tool_choice"
+        ) from exc
 
 
 def _response_format_requests_strict(response_format) -> bool:
@@ -4725,6 +4795,107 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _registered_tool_names(tools: object) -> set[str]:
+    """Return nonempty function names explicitly registered by the request."""
+
+    names: set[str] = set()
+    for tool in tools or []:
+        function = (
+            tool.get("function")
+            if isinstance(tool, dict)
+            else getattr(tool, "function", None)
+        )
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else getattr(function, "name", None)
+        )
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _required_tool_name(tool_choice: object, tools: object) -> str | None:
+    """Validate an OpenAI forced tool choice and return its selected name.
+
+    An empty string means any registered tool is required; ``None`` means
+    ordinary automatic tool selection.
+    """
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return None
+    if tool_choice == "required":
+        name = ""
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            raise InvalidRequestError(
+                "A named tool_choice needs a function name.", field="tool_choice"
+            )
+    else:
+        raise InvalidRequestError("Unsupported tool_choice.", field="tool_choice")
+    registered = _registered_tool_names(tools)
+    if not registered:
+        raise InvalidRequestError(
+            "tool_choice requires at least one tool.", field="tools"
+        )
+    if name and name not in registered:
+        raise InvalidRequestError(
+            "tool_choice names a tool not present in tools.", field="tool_choice"
+        )
+    return name
+
+
+def _forced_tool_call_failure(
+    tool_choice: object, tools: object, calls: object
+) -> dict | None:
+    """Never report a forced tool turn as successful without valid calls."""
+    required_name = _required_tool_name(tool_choice, tools)
+    if required_name is None:
+        return None
+    registered = _registered_tool_names(tools)
+    if not calls:
+        reason = "Model returned no tool call for tool_choice."
+    elif any(
+        (key := _tool_call_semantic_key(call)) is None
+        or key[0] not in registered
+        or (required_name and key[0] != required_name)
+        for call in calls
+    ):
+        reason = "Model returned an invalid or unregistered tool call for tool_choice."
+    else:
+        return None
+    logger.warning("Forced tool call generation failed: %s", reason)
+    return _openai_error_body(reason, 500, code="tool_choice_not_satisfied")
+
+
+def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
+    """Canonical name/JSON-object identity, or ``None`` when malformed.
+
+    Unknown names remain callable output for client-side error feedback.
+    This is syntactic validation, not full JSON Schema argument validation.
+    """
+
+    function = getattr(tool_call, "function", None)
+    name = getattr(function, "name", None)
+    arguments = getattr(function, "arguments", None)
+    if not isinstance(name, str) or not name or not isinstance(arguments, str):
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return name, canonical
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4745,6 +4916,7 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
+    forced_tool_name = _required_tool_name(request.tool_choice, kwargs.get("tools"))
     start_in_thinking = False
     try:
         tokenizer = getattr(engine, "tokenizer", None)
@@ -4793,6 +4965,8 @@ async def stream_chat_completion(
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
         else:
+            stream_content = False
+        if forced_tool_name is not None:
             stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -4948,7 +5122,7 @@ async def stream_chat_completion(
                 logger.warning(f"JSON validation failed: {error}")
 
         # Buffered mode: emit thinking and cleaned content now
-        if not stream_content:
+        if not stream_content and forced_tool_name is None:
             if cleaned_thinking:
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -4983,7 +5157,7 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and forced_tool_name is None:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5021,6 +5195,14 @@ async def stream_chat_completion(
                     tc.function.arguments = json.dumps(args, ensure_ascii=False)
                 except (json.JSONDecodeError, AttributeError):
                     pass
+
+    forced_failure = _forced_tool_call_failure(
+        request.tool_choice, kwargs.get("tools"), tool_calls
+    )
+    if forced_failure:
+        yield f"data: {json.dumps(forced_failure)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Emit tool call chunks if found
     if tool_calls:

@@ -6888,14 +6888,11 @@ class Scheduler:
             logits_processors.append(suppress_processor)
 
         # Add thinking budget processor for reasoning models
-        if (
-            sampling_params.thinking_budget is not None
-            and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
-        ):
+        # Native chat templates may already contain the thinking opener, so
+        # needs_think_prefix can be false even when a budget was requested.
+        # Token resolution below still prevents attaching this processor to
+        # models without a recognizable thinking close marker.
+        if sampling_params.thinking_budget is not None and request is not None:
             request_think_end_id = getattr(request, "think_end_token_id", None)
             if request_think_end_id is not None:
                 think_end_ids = [request_think_end_id]

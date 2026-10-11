@@ -2642,6 +2642,32 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     )
 
 
+class IdleEvictionRequest(BaseModel):
+    exclude_model_id: str = Field(min_length=1)
+
+
+@router.post("/api/models/evict-idle")
+async def evict_idle_models(
+    request: IdleEvictionRequest,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """One idle-only pass; atomic pool checks protect direct and gateway callers."""
+    pool = _get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    # Snapshot candidates; each unload rechecks activity under the pool lock.
+    settings = _get_settings_manager() if _get_settings_manager else None
+    excluded = pool.resolve_model_id(request.exclude_model_id, settings)
+    candidates = [mid for mid in list(pool._entries) if mid != excluded]
+    evicted, skipped = [], []
+    for mid in candidates:
+        if await pool.unload_if_idle_unpinned(mid):
+            evicted.append(mid)
+        else:
+            skipped.append(mid)
+    return {"status": "ok", "evicted": evicted, "skipped": skipped}
+
+
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
